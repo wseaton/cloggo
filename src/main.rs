@@ -22,6 +22,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
+use fixed::types::I32F32;
 use picoserve::extract::State;
 use picoserve::response::IntoResponse;
 use picoserve::routing::{get, parse_path_segment};
@@ -35,8 +36,13 @@ embassy_rp::bind_interrupts!(struct Irqs {
 });
 
 use rand::RngCore;
+
 use static_cell::make_static;
 use {defmt_rtt as _, panic_probe as _};
+
+mod linreg;
+
+use linreg::linear_regression_and_r_squared;
 
 #[embassy_executor::task]
 async fn ethernet_task(
@@ -115,6 +121,31 @@ async fn get_status(
     })
 }
 
+#[derive(Clone, serde::Serialize)]
+struct LinRegResponse {
+    data_points: [(f32, f32); 10],
+    slope: f32,
+    intercept: f32,
+    r_squared: f32,
+}
+
+async fn get_linreg() -> impl IntoResponse {
+    let mut rng = RoscRng;
+    let mut data_points: [(I32F32, I32F32); 10] = [(I32F32::from_num(0), I32F32::from_num(0)); 10];
+    for i in 0..10 {
+        let x = I32F32::from_num(rng.next_u32() % 100);
+        let y = I32F32::from_num(rng.next_u32() % 100);
+        data_points[i] = (x, y);
+    }
+    let (slope, intercept, r_squared) = linear_regression_and_r_squared(&data_points);
+    picoserve::response::Json(LinRegResponse {
+        data_points: data_points.map(|(x, y)| (x.to_num::<f32>(), y.to_num::<f32>())),
+        slope: slope.to_num::<f32>(),
+        intercept: intercept.to_num::<f32>(),
+        r_squared: r_squared.to_num::<f32>(),
+    })
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -172,6 +203,7 @@ async fn main(spawner: Spawner) {
         picoserve::Router::new()
             .route("/", get(|| async move { "Hello World" }))
             .route("/status", get(get_status))
+            .route("/linreg", get(get_linreg))
     }
 
     let app = make_static!(make_app());

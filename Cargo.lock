@@ -183,6 +183,7 @@ dependencies = [
  "portable-atomic",
  "rand",
  "serde",
+ "smallvec",
  "static_cell",
 ]
 
@@ -712,6 +713,7 @@ dependencies = [
  "az",
  "bytemuck",
  "half",
+ "serde",
  "typenum",
 ]
 
@@ -1469,6 +1471,9 @@ name = "smallvec"
 version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4dccd0940a2dcdf68d092b8cbab7dc0ad8fa938bf95787e1b916b0e3d0e8e970"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smoltcp"
