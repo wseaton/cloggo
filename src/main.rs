@@ -97,12 +97,22 @@ struct SharedCalibration(SharedCalibrationMatrix);
 #[derive(Clone, Copy)]
 struct SharedCalibrationStatus(&'static Mutex<CriticalSectionRawMutex, CalibrationStatus>);
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct CalibrationConstants {
+    slope: I32F32,
+    intercept: I32F32,
+}
+
+#[derive(Clone, Copy)]
+struct SharedCalibrationConstants(&'static Mutex<CriticalSectionRawMutex, CalibrationConstants>);
+
 struct AppState {
     temp_sensor: SharedTempSensor,
     adc: SharedADC,
     pressure_sensor: SharedPressureSensor,
     calibration_matrix: SharedCalibration,
     calibration_status: SharedCalibrationStatus,
+    calibration_constants: SharedCalibrationConstants,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -149,6 +159,12 @@ impl picoserve::extract::FromRef<AppState> for SharedCalibrationStatus {
     }
 }
 
+impl picoserve::extract::FromRef<AppState> for SharedCalibrationConstants {
+    fn from_ref(state: &AppState) -> Self {
+        state.calibration_constants
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct Status {
     temp: f32,
@@ -182,6 +198,7 @@ struct LinRegResponse {
 async fn get_linreg(
     State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
     State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+    State(SharedCalibrationConstants(calibration_constants)): State<SharedCalibrationConstants>,
 ) -> impl IntoResponse {
     {
         match *calibration_status.lock().await {
@@ -224,6 +241,12 @@ async fn get_linreg(
 
     let (slope, intercept, r_squared) = linear_regression_and_r_squared(&data_points);
 
+    // save the calibration constants
+    {
+        let mut cal_constants = calibration_constants.lock().await;
+        *cal_constants = CalibrationConstants { slope, intercept };
+    }
+
     {
         // set the calibration status to calibrated
         *calibration_status.lock().await = CalibrationStatus::Calibrated;
@@ -250,6 +273,69 @@ async fn clear_calibration(
         *calibration_status.lock().await = CalibrationStatus::NotCalibrated;
     }
     picoserve::response::Json(CalibrationStatus::NotCalibrated)
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PressureResponse {
+    pressure: f32,
+    raw_reading: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<PressureResponseError>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PressureResponseError {
+    error: &'static str,
+}
+
+async fn get_pressure(
+    State(SharedPressureSensor(pressure_sensor)): State<SharedPressureSensor>,
+    State(SharedADC(adc)): State<SharedADC>,
+    State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+
+    State(SharedCalibrationConstants(calibration_constants)): State<SharedCalibrationConstants>,
+) -> impl IntoResponse {
+    // check calibration status
+    match *calibration_status.lock().await {
+        CalibrationStatus::NotCalibrated => {
+            return picoserve::response::Json(PressureResponse {
+                pressure: 0.0,
+                raw_reading: 0,
+                error: Some(PressureResponseError {
+                    error: "Not calibrated",
+                }),
+            });
+        }
+        CalibrationStatus::Calibrating(_) => {
+            return picoserve::response::Json(PressureResponse {
+                pressure: 0.0,
+                raw_reading: 0,
+                error: Some(PressureResponseError {
+                    error: "Calibrating",
+                }),
+            });
+        }
+        CalibrationStatus::FullMeasurements => {}
+        CalibrationStatus::Calibrated => {}
+    }
+
+    let res = {
+        let mut pressure_channel = pressure_sensor.lock().await;
+        adc.lock()
+            .await
+            .read(&mut pressure_channel)
+            .await
+            .unwrap_or(0)
+    }; // Locks are dropped here because of the block scope.
+       // Now process 'res' without holding any locks.
+    let res = I32F32::from_num(res);
+    let cal_constants = calibration_constants.lock().await;
+    let pressure = cal_constants.slope * res + cal_constants.intercept;
+    picoserve::response::Json(PressureResponse {
+        pressure: pressure.to_num::<f32>(),
+        raw_reading: res.to_num::<u16>(),
+        error: None,
+    })
 }
 
 async fn calibrate_reading(
@@ -348,6 +434,7 @@ async fn main(spawner: Spawner) {
                 ("/calibrate_reading", parse_path_segment::<u16>()),
                 post(calibrate_reading),
             )
+            .route("/pressure", get(get_pressure))
     }
 
     let app = make_static!(make_app());
@@ -367,6 +454,11 @@ async fn main(spawner: Spawner) {
     let calibration_matrix = SharedCalibration(make_static!(Mutex::new(CalibrationMatrix::new())));
     let shared_calibration_status =
         SharedCalibrationStatus(make_static!(Mutex::new(CalibrationStatus::NotCalibrated)));
+    let calibration_constants =
+        SharedCalibrationConstants(make_static!(Mutex::new(CalibrationConstants {
+            slope: I32F32::from_num(0),
+            intercept: I32F32::from_num(0),
+        })));
 
     loop {
         let id = 0;
@@ -398,6 +490,7 @@ async fn main(spawner: Spawner) {
                 pressure_sensor: shared_pressure,
                 calibration_matrix,
                 calibration_status: shared_calibration_status,
+                calibration_constants,
             },
         )
         .await
