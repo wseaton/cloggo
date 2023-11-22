@@ -22,10 +22,10 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
-use fixed::types::I32F32;
+use fixed::types::{I16F16, I32F32};
 use picoserve::extract::State;
 use picoserve::response::IntoResponse;
-use picoserve::routing::{get, parse_path_segment};
+use picoserve::routing::{get, parse_path_segment, post};
 
 embassy_rp::bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
@@ -40,8 +40,10 @@ use rand::RngCore;
 use static_cell::make_static;
 use {defmt_rtt as _, panic_probe as _};
 
+mod ds;
 mod linreg;
 
+use ds::CalibrationMatrix;
 use linreg::linear_regression_and_r_squared;
 
 #[embassy_executor::task]
@@ -77,15 +79,42 @@ impl picoserve::Timer for EmbassyTimer {
     }
 }
 
+type SharedSensor = &'static Mutex<CriticalSectionRawMutex, Channel<'static>>;
+type SharedCalibrationMatrix = &'static Mutex<CriticalSectionRawMutex, CalibrationMatrix>;
+
 #[derive(Clone, Copy)]
-struct SharedTempSensor(&'static Mutex<CriticalSectionRawMutex, Channel<'static>>);
+struct SharedTempSensor(SharedSensor);
+
+#[derive(Clone, Copy)]
+struct SharedPressureSensor(SharedSensor);
 
 #[derive(Clone, Copy)]
 struct SharedADC(&'static Mutex<CriticalSectionRawMutex, Adc<'static, embassy_rp::adc::Async>>);
 
+#[derive(Clone, Copy)]
+struct SharedCalibration(SharedCalibrationMatrix);
+
+#[derive(Clone, Copy)]
+struct SharedCalibrationStatus(&'static Mutex<CriticalSectionRawMutex, CalibrationStatus>);
+
 struct AppState {
     temp_sensor: SharedTempSensor,
     adc: SharedADC,
+    pressure_sensor: SharedPressureSensor,
+    calibration_matrix: SharedCalibration,
+    calibration_status: SharedCalibrationStatus,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum CalibrationStatus {
+    // The calibration process has not started yet
+    NotCalibrated,
+    // The calbiration process is ongoing. The u8 is the number of data points collected so far.
+    Calibrating(u8),
+    // The calibration matrix is full, but the calibration process is not done yet.
+    FullMeasurements,
+    // Calibration is done (eg. constants have been calculated)
+    Calibrated,
 }
 
 type AppRouter = impl picoserve::routing::PathRouter<AppState>;
@@ -96,9 +125,27 @@ impl picoserve::extract::FromRef<AppState> for SharedTempSensor {
     }
 }
 
+impl picoserve::extract::FromRef<AppState> for SharedCalibration {
+    fn from_ref(state: &AppState) -> Self {
+        state.calibration_matrix
+    }
+}
+
+impl picoserve::extract::FromRef<AppState> for SharedPressureSensor {
+    fn from_ref(state: &AppState) -> Self {
+        state.pressure_sensor
+    }
+}
+
 impl picoserve::extract::FromRef<AppState> for SharedADC {
     fn from_ref(state: &AppState) -> Self {
         state.adc
+    }
+}
+
+impl picoserve::extract::FromRef<AppState> for SharedCalibrationStatus {
+    fn from_ref(state: &AppState) -> Self {
+        state.calibration_status
     }
 }
 
@@ -123,27 +170,119 @@ async fn get_status(
 
 #[derive(Clone, serde::Serialize)]
 struct LinRegResponse {
-    data_points: [(f32, f32); 10],
+    // skip serializing this field if it's None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_points: Option<[(f32, f32); 10]>,
     slope: f32,
     intercept: f32,
     r_squared: f32,
+    calibration_status: CalibrationStatus,
 }
 
-async fn get_linreg() -> impl IntoResponse {
-    let mut rng = RoscRng;
-    let mut data_points: [(I32F32, I32F32); 10] = [(I32F32::from_num(0), I32F32::from_num(0)); 10];
-    for i in 0..10 {
-        let x = I32F32::from_num(rng.next_u32() % 100);
-        let y = I32F32::from_num(rng.next_u32() % 100);
-        data_points[i] = (x, y);
+async fn get_linreg(
+    State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
+    State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+) -> impl IntoResponse {
+    {
+        match *calibration_status.lock().await {
+            CalibrationStatus::NotCalibrated => {
+                return picoserve::response::Json(LinRegResponse {
+                    data_points: None,
+                    slope: 0.0,
+                    intercept: 0.0,
+                    r_squared: 0.0,
+                    calibration_status: CalibrationStatus::NotCalibrated,
+                });
+            }
+            CalibrationStatus::Calibrating(_) => {
+                return picoserve::response::Json(LinRegResponse {
+                    data_points: None,
+                    slope: 0.0,
+                    intercept: 0.0,
+                    r_squared: 0.0,
+                    calibration_status: CalibrationStatus::Calibrating(0),
+                });
+            }
+            // in these cases we want to continue with the calibration
+            CalibrationStatus::FullMeasurements => {}
+            CalibrationStatus::Calibrated => {}
+        }
     }
+    // allocate a new array of I32F32s for input to the linear regression function
+    let mut data_points: [(I32F32, I32F32); 10] = [(I32F32::from_num(0), I32F32::from_num(0)); 10];
+    // scoping here to not hold the lock for longer than necessary
+    {
+        let cal_matrix = calibration_matrix.lock().await;
+
+        // copy the calibration matrix into the new array
+        for (i, (x, y)) in cal_matrix.iter().enumerate() {
+            let x = I32F32::from_num(*x);
+            let y = I32F32::from_num(*y);
+            data_points[i] = (x, y);
+        }
+    }
+
     let (slope, intercept, r_squared) = linear_regression_and_r_squared(&data_points);
+
+    {
+        // set the calibration status to calibrated
+        *calibration_status.lock().await = CalibrationStatus::Calibrated;
+    }
+
     picoserve::response::Json(LinRegResponse {
-        data_points: data_points.map(|(x, y)| (x.to_num::<f32>(), y.to_num::<f32>())),
+        data_points: Some(data_points.map(|(x, y)| (x.to_num::<f32>(), y.to_num::<f32>()))),
         slope: slope.to_num::<f32>(),
         intercept: intercept.to_num::<f32>(),
         r_squared: r_squared.to_num::<f32>(),
+        calibration_status: CalibrationStatus::Calibrated,
     })
+}
+
+async fn clear_calibration(
+    State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
+    State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+) -> impl IntoResponse {
+    {
+        let mut cal_matrix = calibration_matrix.lock().await;
+        cal_matrix.clear();
+    }
+    {
+        *calibration_status.lock().await = CalibrationStatus::NotCalibrated;
+    }
+    picoserve::response::Json(CalibrationStatus::NotCalibrated)
+}
+
+async fn calibrate_reading(
+    read_psi: u16,
+    State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
+    State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+    State(SharedPressureSensor(pressure_sensor)): State<SharedPressureSensor>,
+    State(SharedADC(adc)): State<SharedADC>,
+) -> impl IntoResponse {
+    // get the voltage reading of the pressure sensor
+    let res = {
+        let mut pressure_channel = pressure_sensor.lock().await;
+        adc.lock()
+            .await
+            .read(&mut pressure_channel)
+            .await
+            .unwrap_or(0)
+    }; // Locks are dropped here because of the block scope.
+       // Now process 'res' without holding any locks.
+
+    // add the reading to the calibration matrix
+    {
+        let mut cal_matrix = calibration_matrix.lock().await;
+
+        cal_matrix.push((I32F32::from_num(res), I32F32::from_num(read_psi)));
+        if !cal_matrix.is_full() {
+            picoserve::response::Json(CalibrationStatus::Calibrating(cal_matrix.len() as u8))
+        } else {
+            // if the calibration matrix is full, set the calibration status to calibrated
+            *calibration_status.lock().await = CalibrationStatus::FullMeasurements;
+            picoserve::response::Json(CalibrationStatus::FullMeasurements)
+        }
+    }
 }
 
 #[embassy_executor::main]
@@ -175,10 +314,10 @@ async fn main(spawner: Spawner) {
 
     let adc = Adc::new(p.ADC, Irqs, Config::default());
 
-    // let mut p26 = Channel::new_pin(p.PIN_26, Pull::None);
-    // let mut p27 = Channel::new_pin(p.PIN_27, Pull::None);
-    // let mut p28 = Channel::new_pin(p.PIN_28, Pull::None);
     let ts = Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    // p26 is the adc input for the pressure sensor
+    // p27 and p28 are not being used currently
+    let p26 = Channel::new_pin(p.PIN_26, Pull::None);
 
     // Generate random seed
     let seed = rng.next_u64();
@@ -204,6 +343,11 @@ async fn main(spawner: Spawner) {
             .route("/", get(|| async move { "Hello World" }))
             .route("/status", get(get_status))
             .route("/linreg", get(get_linreg))
+            .route("/clear_calibration", post(clear_calibration))
+            .route(
+                ("/calibrate_reading", parse_path_segment::<u16>()),
+                post(calibrate_reading),
+            )
     }
 
     let app = make_static!(make_app());
@@ -218,6 +362,11 @@ async fn main(spawner: Spawner) {
 
     let shared_temp = SharedTempSensor(make_static!(Mutex::new(ts)));
     let shared_adc = SharedADC(make_static!(Mutex::new(adc)));
+    let shared_pressure = SharedPressureSensor(make_static!(Mutex::new(p26)));
+
+    let calibration_matrix = SharedCalibration(make_static!(Mutex::new(CalibrationMatrix::new())));
+    let shared_calibration_status =
+        SharedCalibrationStatus(make_static!(Mutex::new(CalibrationStatus::NotCalibrated)));
 
     loop {
         let id = 0;
@@ -246,6 +395,9 @@ async fn main(spawner: Spawner) {
             &AppState {
                 temp_sensor: shared_temp,
                 adc: shared_adc,
+                pressure_sensor: shared_pressure,
+                calibration_matrix,
+                calibration_status: shared_calibration_status,
             },
         )
         .await
