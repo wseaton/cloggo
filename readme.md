@@ -58,6 +58,6 @@ Once you have a [`probe-rs`](https://probe.rs/) and pi pico compatible debugger 
 
 - [ ] actually implement the ADC reads for the transducers (waiting on some parts)
 - [x] implement a calibration routine that can be done over rest
-- [ ] implement saving calibration function in non-volatile memory
+- [x] implement saving calibration function in non-volatile memory
 - [ ] MQTT integration?
 - [ ] explore if multiple sensors can be managed by a single Pico

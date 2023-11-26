@@ -1,3 +1,5 @@
+use core::fmt;
+
 use fixed::types::I32F32;
 
 pub struct CalibrationMatrix {
@@ -71,5 +73,55 @@ impl CalibrationMatrix {
         } else {
             None
         }
+    }
+}
+
+pub struct CountingWriter<'a> {
+    buffer: &'a mut [u8],
+    position: usize,
+}
+
+impl<'a> CountingWriter<'a> {
+    pub fn new(buffer: &'a mut [u8]) -> CountingWriter<'a> {
+        CountingWriter {
+            buffer,
+            position: 0,
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+impl<'a> minicbor::encode::Write for CountingWriter<'a> {
+    type Error = BufferTooSmall;
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        let end = self.position + buf.len();
+        if end > self.buffer.len() {
+            return Err(BufferTooSmall {
+                actual_size: self.buffer.len(),
+                required_size: end,
+            });
+        }
+
+        self.buffer[self.position..end].copy_from_slice(buf);
+        self.position = end;
+        Ok(())
+    }
+}
+
+pub struct BufferTooSmall {
+    actual_size: usize,
+    required_size: usize,
+}
+
+impl fmt::Debug for BufferTooSmall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferTooSmall")
+            .field("actual_size", &self.actual_size)
+            .field("required_size", &self.required_size)
+            .finish()
     }
 }

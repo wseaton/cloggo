@@ -6,7 +6,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use defmt::*;
+use defmt::{debug, error, info, unwrap};
 use embassy_executor::Spawner;
 use embassy_futures::yield_now;
 use embassy_net::{Stack, StackResources};
@@ -15,12 +15,19 @@ use embassy_net_wiznet::State as WizState;
 use embassy_net_wiznet::*;
 use embassy_rp::adc::{Adc, Channel, Config, InterruptHandler};
 use embassy_rp::clocks::RoscRng;
+
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::{PIN_17, PIN_20, PIN_21, SPI0};
-use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
+use embassy_rp::peripherals::{FLASH, PIN_17, PIN_20, PIN_21, SPI0};
+use embassy_rp::spi::{Async as AsyncSPI, Config as SpiConfig, Spi};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::{Delay, Duration};
+use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
+
+use embassy_rp::flash::{Async, ERASE_SIZE, FLASH_BASE};
+use embassy_rp::flash::{Flash, Mode};
+use minicbor::decode::info;
+use minicbor::{Decode, Decoder, Encode, Encoder};
+use serde::{Deserialize, Serialize};
 
 use fixed::types::{I16F16, I32F32};
 use picoserve::extract::State;
@@ -43,7 +50,7 @@ use {defmt_rtt as _, panic_probe as _};
 mod ds;
 mod linreg;
 
-use ds::CalibrationMatrix;
+use ds::{CalibrationMatrix, CountingWriter};
 use linreg::linear_regression_and_r_squared;
 
 #[embassy_executor::task]
@@ -51,7 +58,7 @@ async fn ethernet_task(
     runner: Runner<
         'static,
         W5500,
-        ExclusiveDevice<Spi<'static, SPI0, Async>, Output<'static, PIN_17>, Delay>,
+        ExclusiveDevice<Spi<'static, SPI0, AsyncSPI>, Output<'static, PIN_17>, Delay>,
         Input<'static, PIN_21>,
         Output<'static, PIN_20>,
     >,
@@ -63,6 +70,9 @@ async fn ethernet_task(
 async fn net_task(stack: &'static Stack<Device<'static>>) -> ! {
     stack.run().await
 }
+
+const ADDR_OFFSET: u32 = 0x100000;
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 struct EmbassyTimer;
 
@@ -92,6 +102,14 @@ struct SharedPressureSensor(SharedSensor);
 struct SharedADC(&'static Mutex<CriticalSectionRawMutex, Adc<'static, embassy_rp::adc::Async>>);
 
 #[derive(Clone, Copy)]
+struct SharedFlash(
+    &'static Mutex<
+        CriticalSectionRawMutex,
+        Flash<'static, FLASH, embassy_rp::flash::Async, FLASH_SIZE>,
+    >,
+);
+
+#[derive(Clone, Copy)]
 struct SharedCalibration(SharedCalibrationMatrix);
 
 #[derive(Clone, Copy)]
@@ -103,8 +121,94 @@ struct CalibrationConstants {
     intercept: I32F32,
 }
 
-#[derive(Clone, Copy)]
-struct SharedCalibrationConstants(&'static Mutex<CriticalSectionRawMutex, CalibrationConstants>);
+// Implement Encode and Decode for CalibrationConstants
+impl Encode<()> for CalibrationConstants {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _: &mut (),
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.array(2)?
+            .encode(self.slope.to_num::<f32>())?
+            .encode(self.intercept.to_num::<f32>())?;
+        Ok(())
+    }
+}
+
+impl<'a> Decode<'a, ()> for CalibrationConstants {
+    fn decode(d: &mut Decoder<'a>, _: &mut ()) -> Result<Self, minicbor::decode::Error> {
+        d.array()?;
+        let slope = I32F32::from_num(d.decode::<f32>()?);
+        let intercept = I32F32::from_num(d.decode::<f32>()?);
+        Ok(CalibrationConstants { slope, intercept })
+    }
+}
+
+async fn write_calibration_data(
+    flash: &mut Flash<'static, FLASH, embassy_rp::flash::Async, FLASH_SIZE>,
+    constants: &CalibrationConstants,
+    offset: u32,
+) -> Result<(), embassy_rp::flash::Error> {
+    if offset % ERASE_SIZE as u32 != 0 {
+        debug!("Offset is not aligned to ERASE_SIZE");
+        return Err(embassy_rp::flash::Error::Unaligned);
+    }
+
+    let mut buffer = [0u8; 64];
+    let mut writer = CountingWriter::new(&mut buffer);
+    let mut enc = Encoder::new(&mut writer);
+
+    constants
+        .encode(&mut enc, &mut ())
+        .map_err(|_| embassy_rp::flash::Error::Other)?;
+    debug!("Calibration constants encoded");
+
+    let size = writer.position();
+    if (offset as usize + size) > flash.capacity() {
+        debug!("Data size and offset exceed flash capacity");
+        return Err(embassy_rp::flash::Error::OutOfBounds);
+    }
+
+    flash.blocking_erase(offset, offset + ERASE_SIZE as u32)?;
+    debug!("Flash sector erased");
+
+    flash.blocking_write(offset, &buffer[..size])?;
+    debug!("Calibration constants written to flash");
+
+    Ok(())
+}
+
+// TODO: add some validation to the data read from flash
+async fn read_calibration_data(
+    flash: &mut Flash<'static, FLASH, embassy_rp::flash::Async, FLASH_SIZE>,
+    offset: u32,
+) -> Result<CalibrationConstants, embassy_rp::flash::Error> {
+    defmt::debug!(
+        "Attempting to read calibration data from flash at offset {:?}",
+        offset
+    );
+
+    let mut buffer = [0u8; 64]; // Adjust the size accordingly
+    match flash.blocking_read(offset, &mut buffer) {
+        Ok(_) => defmt::debug!("Read operation successful."),
+        Err(e) => {
+            defmt::debug!("Failed to read from flash: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    let mut dec = Decoder::new(&buffer[..]);
+    match CalibrationConstants::decode(&mut dec, &mut ()) {
+        Ok(constants) => {
+            defmt::debug!("Decoding successful.");
+            Ok(constants)
+        }
+        Err(_e) => {
+            defmt::error!("Failed to decode calibration data");
+            Err(embassy_rp::flash::Error::Other)
+        }
+    }
+}
 
 struct AppState {
     temp_sensor: SharedTempSensor,
@@ -112,7 +216,7 @@ struct AppState {
     pressure_sensor: SharedPressureSensor,
     calibration_matrix: SharedCalibration,
     calibration_status: SharedCalibrationStatus,
-    calibration_constants: SharedCalibrationConstants,
+    flash: SharedFlash,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -124,7 +228,7 @@ enum CalibrationStatus {
     // The calibration matrix is full, but the calibration process is not done yet.
     FullMeasurements,
     // Calibration is done (eg. constants have been calculated)
-    Calibrated,
+    Calibrated(CalibrationConstants),
 }
 
 type AppRouter = impl picoserve::routing::PathRouter<AppState>;
@@ -159,9 +263,9 @@ impl picoserve::extract::FromRef<AppState> for SharedCalibrationStatus {
     }
 }
 
-impl picoserve::extract::FromRef<AppState> for SharedCalibrationConstants {
+impl picoserve::extract::FromRef<AppState> for SharedFlash {
     fn from_ref(state: &AppState) -> Self {
-        state.calibration_constants
+        state.flash
     }
 }
 
@@ -198,72 +302,90 @@ struct LinRegResponse {
 async fn get_linreg(
     State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
     State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
-    State(SharedCalibrationConstants(calibration_constants)): State<SharedCalibrationConstants>,
+    State(SharedFlash(flash)): State<SharedFlash>,
 ) -> impl IntoResponse {
-    {
-        match *calibration_status.lock().await {
-            CalibrationStatus::NotCalibrated => {
-                return picoserve::response::Json(LinRegResponse {
-                    data_points: None,
-                    slope: 0.0,
-                    intercept: 0.0,
-                    r_squared: 0.0,
-                    calibration_status: CalibrationStatus::NotCalibrated,
-                });
+    // Immediately lock both resources
+    let mut cal_status = calibration_status.lock().await;
+    let cal_matrix = calibration_matrix.lock().await;
+
+    // Depending on the calibration status, we may not need to do anything
+    match *cal_status {
+        CalibrationStatus::NotCalibrated => picoserve::response::Json(LinRegResponse {
+            data_points: None,
+            slope: 0.0,
+            intercept: 0.0,
+            r_squared: 0.0,
+            calibration_status: CalibrationStatus::NotCalibrated,
+        }),
+        CalibrationStatus::Calibrating(_) => picoserve::response::Json(LinRegResponse {
+            data_points: None,
+            slope: 0.0,
+            intercept: 0.0,
+            r_squared: 0.0,
+            calibration_status: CalibrationStatus::Calibrating(0),
+        }),
+        // For FullMeasurements and Calibrated, we proceed with calibration
+        CalibrationStatus::FullMeasurements | CalibrationStatus::Calibrated(_) => {
+            info!("Calibration matrix is full, calculating calibration constants");
+            // allocate a new array of I32F32s for input to the linear regression function
+            let mut data_points: [(I32F32, I32F32); 10] =
+                [(I32F32::from_num(0), I32F32::from_num(0)); 10];
+
+            // copy the calibration matrix into the new array
+            for (i, (x, y)) in cal_matrix.iter().enumerate() {
+                let x = I32F32::from_num(*x);
+                let y = I32F32::from_num(*y);
+                data_points[i] = (x, y);
             }
-            CalibrationStatus::Calibrating(_) => {
-                return picoserve::response::Json(LinRegResponse {
-                    data_points: None,
-                    slope: 0.0,
-                    intercept: 0.0,
-                    r_squared: 0.0,
-                    calibration_status: CalibrationStatus::Calibrating(0),
-                });
-            }
-            // in these cases we want to continue with the calibration
-            CalibrationStatus::FullMeasurements => {}
-            CalibrationStatus::Calibrated => {}
+
+            // Now that we have the data, we can release the calibration matrix lock
+            drop(cal_matrix);
+
+            let (slope, intercept, r_squared) = linear_regression_and_r_squared(&data_points);
+            info!(
+                "Calibration constants calculated: slope = {}, intercept = {}, r_squared = {}",
+                slope.to_num::<f32>(),
+                intercept.to_num::<f32>(),
+                r_squared.to_num::<f32>()
+            );
+
+            // set the calibration status to calibrated
+            *cal_status = CalibrationStatus::Calibrated(CalibrationConstants { slope, intercept });
+
+            info!("Writing the calibration constants to flash");
+            let mut flash = flash.lock().await;
+            match write_calibration_data(
+                &mut flash,
+                &CalibrationConstants { slope, intercept },
+                ADDR_OFFSET,
+            )
+            .await
+            {
+                Ok(_) => info!("Calibration constants written to flash"),
+                Err(e) => error!("Failed to write calibration constants to flash: {:?}", e),
+            };
+
+            // We can also release the calibration status lock before creating the response
+            drop(cal_status);
+
+            picoserve::response::Json(LinRegResponse {
+                data_points: Some(data_points.map(|(x, y)| (x.to_num::<f32>(), y.to_num::<f32>()))),
+                slope: slope.to_num::<f32>(),
+                intercept: intercept.to_num::<f32>(),
+                r_squared: r_squared.to_num::<f32>(),
+                calibration_status: CalibrationStatus::Calibrated(CalibrationConstants {
+                    slope,
+                    intercept,
+                }),
+            })
         }
     }
-    // allocate a new array of I32F32s for input to the linear regression function
-    let mut data_points: [(I32F32, I32F32); 10] = [(I32F32::from_num(0), I32F32::from_num(0)); 10];
-    // scoping here to not hold the lock for longer than necessary
-    {
-        let cal_matrix = calibration_matrix.lock().await;
-
-        // copy the calibration matrix into the new array
-        for (i, (x, y)) in cal_matrix.iter().enumerate() {
-            let x = I32F32::from_num(*x);
-            let y = I32F32::from_num(*y);
-            data_points[i] = (x, y);
-        }
-    }
-
-    let (slope, intercept, r_squared) = linear_regression_and_r_squared(&data_points);
-
-    // save the calibration constants
-    {
-        let mut cal_constants = calibration_constants.lock().await;
-        *cal_constants = CalibrationConstants { slope, intercept };
-    }
-
-    {
-        // set the calibration status to calibrated
-        *calibration_status.lock().await = CalibrationStatus::Calibrated;
-    }
-
-    picoserve::response::Json(LinRegResponse {
-        data_points: Some(data_points.map(|(x, y)| (x.to_num::<f32>(), y.to_num::<f32>()))),
-        slope: slope.to_num::<f32>(),
-        intercept: intercept.to_num::<f32>(),
-        r_squared: r_squared.to_num::<f32>(),
-        calibration_status: CalibrationStatus::Calibrated,
-    })
 }
 
 async fn clear_calibration(
     State(SharedCalibration(calibration_matrix)): State<SharedCalibration>,
     State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
+    State(SharedFlash(flash)): State<SharedFlash>,
 ) -> impl IntoResponse {
     {
         let mut cal_matrix = calibration_matrix.lock().await;
@@ -272,6 +394,19 @@ async fn clear_calibration(
     {
         *calibration_status.lock().await = CalibrationStatus::NotCalibrated;
     }
+
+    // clear out the calibration data in flash
+    info!("Clearing calibration data in flash");
+    let mut flash = flash.lock().await;
+    let constants = CalibrationConstants {
+        slope: I32F32::from_num(0),
+        intercept: I32F32::from_num(0),
+    };
+    match write_calibration_data(&mut flash, &constants, ADDR_OFFSET).await {
+        Ok(_) => info!("Calibration constants written to flash"),
+        Err(e) => error!("Failed to write calibration constants to flash: {:?}", e),
+    };
+
     picoserve::response::Json(CalibrationStatus::NotCalibrated)
 }
 
@@ -292,50 +427,35 @@ async fn get_pressure(
     State(SharedPressureSensor(pressure_sensor)): State<SharedPressureSensor>,
     State(SharedADC(adc)): State<SharedADC>,
     State(SharedCalibrationStatus(calibration_status)): State<SharedCalibrationStatus>,
-
-    State(SharedCalibrationConstants(calibration_constants)): State<SharedCalibrationConstants>,
 ) -> impl IntoResponse {
     // check calibration status
-    match *calibration_status.lock().await {
-        CalibrationStatus::NotCalibrated => {
-            return picoserve::response::Json(PressureResponse {
-                pressure: 0.0,
-                raw_reading: 0,
-                error: Some(PressureResponseError {
-                    error: "Not calibrated",
-                }),
-            });
-        }
-        CalibrationStatus::Calibrating(_) => {
-            return picoserve::response::Json(PressureResponse {
-                pressure: 0.0,
-                raw_reading: 0,
-                error: Some(PressureResponseError {
-                    error: "Calibrating",
-                }),
-            });
-        }
-        CalibrationStatus::FullMeasurements => {}
-        CalibrationStatus::Calibrated => {}
+    let cs = *calibration_status.lock().await;
+    if let CalibrationStatus::Calibrated(cal_constants) = cs {
+        let res = {
+            let mut pressure_channel = pressure_sensor.lock().await;
+            adc.lock()
+                .await
+                .read(&mut pressure_channel)
+                .await
+                .unwrap_or(0)
+        }; // Locks are dropped here because of the block scope.
+           // Now process 'res' without holding any locks.
+        let res = I32F32::from_num(res);
+        let pressure = cal_constants.slope * res + cal_constants.intercept;
+        picoserve::response::Json(PressureResponse {
+            pressure: pressure.to_num::<f32>(),
+            raw_reading: res.to_num::<u16>(),
+            error: None,
+        })
+    } else {
+        picoserve::response::Json(PressureResponse {
+            pressure: 0.0,
+            raw_reading: 0,
+            error: Some(PressureResponseError {
+                error: "Calibration not complete",
+            }),
+        })
     }
-
-    let res = {
-        let mut pressure_channel = pressure_sensor.lock().await;
-        adc.lock()
-            .await
-            .read(&mut pressure_channel)
-            .await
-            .unwrap_or(0)
-    }; // Locks are dropped here because of the block scope.
-       // Now process 'res' without holding any locks.
-    let res = I32F32::from_num(res);
-    let cal_constants = calibration_constants.lock().await;
-    let pressure = cal_constants.slope * res + cal_constants.intercept;
-    picoserve::response::Json(PressureResponse {
-        pressure: pressure.to_num::<f32>(),
-        raw_reading: res.to_num::<u16>(),
-        error: None,
-    })
 }
 
 async fn calibrate_reading(
@@ -353,17 +473,22 @@ async fn calibrate_reading(
             .read(&mut pressure_channel)
             .await
             .unwrap_or(0)
-    }; // Locks are dropped here because of the block scope.
-       // Now process 'res' without holding any locks.
+    };
 
+    debug!(
+        "Calibration reading: {} PSI (user input), {} ADC",
+        read_psi, res
+    );
     // add the reading to the calibration matrix
     {
         let mut cal_matrix = calibration_matrix.lock().await;
 
         cal_matrix.push((I32F32::from_num(res), I32F32::from_num(read_psi)));
         if !cal_matrix.is_full() {
+            info!("Calibration matrix is not full yet");
             picoserve::response::Json(CalibrationStatus::Calibrating(cal_matrix.len() as u8))
         } else {
+            info!("Calibration matrix is full, setting state to FullMeasurements");
             // if the calibration matrix is full, set the calibration status to calibrated
             *calibration_status.lock().await = CalibrationStatus::FullMeasurements;
             picoserve::response::Json(CalibrationStatus::FullMeasurements)
@@ -383,6 +508,14 @@ async fn main(spawner: Spawner) {
     let cs = Output::new(p.PIN_17, Level::High);
     let w5500_int = Input::new(p.PIN_21, Pull::Up);
     let w5500_reset = Output::new(p.PIN_20, Level::High);
+
+    // add some delay to give an attached debug probe time to parse the
+    // defmt RTT header. Reading that header might touch flash memory, which
+    // interferes with flash write operations.
+    // https://github.com/knurling-rs/defmt/pull/683
+    Timer::after_millis(10).await;
+
+    let mut flash = embassy_rp::flash::Flash::<_, Async, FLASH_SIZE>::new(p.FLASH, p.DMA_CH3);
 
     let mac_addr = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
 
@@ -447,18 +580,23 @@ async fn main(spawner: Spawner) {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 1024];
 
+    let shared_calibration_status =
+        if let Ok(constants) = read_calibration_data(&mut flash, ADDR_OFFSET).await {
+            info!("Calibration constants loaded");
+            SharedCalibrationStatus(make_static!(Mutex::new(CalibrationStatus::Calibrated(
+                constants
+            ))))
+        } else {
+            info!("No calibration constants found");
+            SharedCalibrationStatus(make_static!(Mutex::new(CalibrationStatus::NotCalibrated)))
+        };
+
+    let shared_flash = SharedFlash(make_static!(Mutex::new(flash)));
     let shared_temp = SharedTempSensor(make_static!(Mutex::new(ts)));
     let shared_adc = SharedADC(make_static!(Mutex::new(adc)));
     let shared_pressure = SharedPressureSensor(make_static!(Mutex::new(p26)));
 
     let calibration_matrix = SharedCalibration(make_static!(Mutex::new(CalibrationMatrix::new())));
-    let shared_calibration_status =
-        SharedCalibrationStatus(make_static!(Mutex::new(CalibrationStatus::NotCalibrated)));
-    let calibration_constants =
-        SharedCalibrationConstants(make_static!(Mutex::new(CalibrationConstants {
-            slope: I32F32::from_num(0),
-            intercept: I32F32::from_num(0),
-        })));
 
     loop {
         let id = 0;
@@ -490,7 +628,7 @@ async fn main(spawner: Spawner) {
                 pressure_sensor: shared_pressure,
                 calibration_matrix,
                 calibration_status: shared_calibration_status,
-                calibration_constants,
+                flash: shared_flash,
             },
         )
         .await

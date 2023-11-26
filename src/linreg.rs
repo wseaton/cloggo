@@ -1,7 +1,4 @@
-#![no_std]
-
 use fixed::types::I32F32;
-use heapless::Vec;
 
 pub fn linear_regression_and_r_squared(
     data_points: &[(I32F32, I32F32); 10],
