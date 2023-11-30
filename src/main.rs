@@ -53,16 +53,16 @@ mod linreg;
 use ds::{CalibrationMatrix, CountingWriter};
 use linreg::linear_regression_and_r_squared;
 
+type RunnerType = Runner<
+    'static,
+    W5500,
+    ExclusiveDevice<Spi<'static, SPI0, AsyncSPI>, Output<'static, PIN_17>, Delay>,
+    Input<'static, PIN_21>,
+    Output<'static, PIN_20>,
+>;
+
 #[embassy_executor::task]
-async fn ethernet_task(
-    runner: Runner<
-        'static,
-        W5500,
-        ExclusiveDevice<Spi<'static, SPI0, AsyncSPI>, Output<'static, PIN_17>, Delay>,
-        Input<'static, PIN_21>,
-        Output<'static, PIN_20>,
-    >,
-) -> ! {
+async fn ethernet_task(runner: RunnerType) -> ! {
     runner.run().await
 }
 
@@ -496,6 +496,58 @@ async fn calibrate_reading(
     }
 }
 
+// Increasing this number causes Socket Stack exhaustion on the W5500
+const WEB_TASK_POOL_SIZE: usize = 1;
+
+#[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
+async fn web_task(
+    id: usize,
+    stack: &'static Stack<Device<'_>>,
+    app: &'static picoserve::Router<AppRouter, AppState>,
+    config: &'static picoserve::Config<Duration>,
+    state: AppState,
+) -> ! {
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
+
+    loop {
+        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+
+        log::info!("{id}: Listening on TCP:80...");
+        if let Err(e) = socket.accept(80).await {
+            log::warn!("{id}: accept error: {:?}", e);
+            continue;
+        }
+
+        log::info!(
+            "{id}: Received connection from {:?}",
+            socket.remote_endpoint()
+        );
+
+        let (socket_rx, socket_tx) = socket.split();
+
+        match picoserve::serve_with_state(
+            app,
+            EmbassyTimer,
+            config,
+            &mut [0; 2048],
+            socket_rx,
+            socket_tx,
+            &state,
+        )
+        .await
+        {
+            Ok(handled_requests_count) => {
+                log::info!(
+                    "{handled_requests_count} requests handled from {:?}",
+                    socket.remote_endpoint()
+                );
+            }
+            Err(err) => log::error!("{err:?}"),
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -517,7 +569,7 @@ async fn main(spawner: Spawner) {
 
     let mut flash = embassy_rp::flash::Flash::<_, Async, FLASH_SIZE>::new(p.FLASH, p.DMA_CH3);
 
-    let mac_addr = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mac_addr = [0x02, 0x10, 0x10, 0x10, 0x10, 0x10];
 
     let state = make_static!(WizState::<8, 8>::new());
 
@@ -577,9 +629,6 @@ async fn main(spawner: Spawner) {
         read_request_timeout: Some(Duration::from_secs(1)),
     });
 
-    let mut rx_buffer = [0; 1024];
-    let mut tx_buffer = [0; 1024];
-
     let shared_calibration_status =
         if let Ok(constants) = read_calibration_data(&mut flash, ADDR_OFFSET).await {
             info!("Calibration constants loaded");
@@ -598,31 +647,13 @@ async fn main(spawner: Spawner) {
 
     let calibration_matrix = SharedCalibration(make_static!(Mutex::new(CalibrationMatrix::new())));
 
-    loop {
-        let id = 0;
-        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-        log::info!("{id}: Listening on TCP:80...");
-        if let Err(e) = socket.accept(80).await {
-            log::warn!("{id}: accept error: {:?}", e);
-            continue;
-        }
-
-        log::info!(
-            "{id}: Received connection from {:?}",
-            socket.remote_endpoint()
-        );
-
-        let (socket_rx, socket_tx) = socket.split();
-
-        match picoserve::serve_with_state(
+    for id in 0..WEB_TASK_POOL_SIZE {
+        spawner.must_spawn(web_task(
+            id,
+            stack,
             app,
-            EmbassyTimer,
             config,
-            &mut [0; 2048],
-            socket_rx,
-            socket_tx,
-            &AppState {
+            AppState {
                 temp_sensor: shared_temp,
                 adc: shared_adc,
                 pressure_sensor: shared_pressure,
@@ -630,17 +661,7 @@ async fn main(spawner: Spawner) {
                 calibration_status: shared_calibration_status,
                 flash: shared_flash,
             },
-        )
-        .await
-        {
-            Ok(handled_requests_count) => {
-                log::info!(
-                    "{handled_requests_count} requests handled from {:?}",
-                    socket.remote_endpoint()
-                );
-            }
-            Err(err) => log::error!("{err:?}"),
-        }
+        ));
     }
 }
 
